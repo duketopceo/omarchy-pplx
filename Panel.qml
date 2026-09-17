@@ -37,12 +37,10 @@ Panel {
   readonly property color statusColor: !statusKnown ? muted : (installed && authed ? accent : urgent)
 
   // Absolute interpreter + minimal env: a PATH-preceding shadow "python3"
-  // must never run inside this long-lived shell process. HOME passes
-  // through because the helpers' omaseal keyring lookup resolves under ~,
-  // and PERPLEXITY_API_KEY passes through so the helper's documented
-  // env-var resolution order works when the key is exported into the
-  // shell session. The key only ever travels inside the child env —
-  // never on argv, never rendered, never logged.
+  // must never run here. HOME passes through so the helpers' omaseal
+  // keyring lookup resolves under ~, PERPLEXITY_API_KEY so the helper's
+  // env-var resolution order works — the key lives only in the child
+  // env, never on argv, never rendered, never logged.
   readonly property string py: "/usr/bin/python3"
   readonly property var procEnv: ({
     "PATH": "/usr/bin:/bin",
@@ -62,6 +60,16 @@ Panel {
     easing.type: Easing.InOutSine
   }
 
+  // Both helpers os.setsid() into their own session group, so a
+  // group-kill reaches the whole tree even if Python is stuck in a wait.
+  function groupKill(proc) {
+    if (!proc.running) return
+    var pid = proc.pid
+    if (pid > 0)
+      Quickshell.execDetached(["/usr/bin/kill", "-KILL", "--", "-" + pid.toString()])
+    proc.signal(9)
+  }
+
   function refreshStatus() {
     if (!statusProc.running) {
       statusProc.running = true
@@ -77,46 +85,34 @@ Panel {
     elapsedMs = 0
     hasSearched = true
     isSearching = true
-    // The query is passed as a single argv element — there is no shell,
-    // so it is never interpolated, word-split, or re-parsed.
+    // The query is a single argv element — no shell, no interpolation.
     searchProc.command = [root.py, root.pluginRoot + "/bin/pplx_search.py", q]
     searchDeadline.restart()
     searchProc.running = true
   }
 
   function killSearch() {
-    if (searchProc.running) {
-      var pid = searchProc.pid
-      if (pid > 0)
-        Quickshell.execDetached(["/usr/bin/kill", "-KILL", "--", "-" + pid.toString()])
-      searchProc.signal(9)
-    }
+    groupKill(searchProc)
     searchDeadline.stop()
     isSearching = false
   }
 
   function openHit(url) {
-    // Helper output is semi-trusted: xdg-open only ever gets a single
-    // argv element whose scheme is strictly http(s).
+    // xdg-open only gets a single argv element with an http(s) scheme.
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) return
     Quickshell.execDetached(["/usr/bin/xdg-open", url])
   }
 
   onOpenedChanged: {
-    if (opened) {
-      refreshStatus()
-    } else {
-      queryField.text = ""
-      killSearch()
-    }
+    if (opened) refreshStatus()
+    else { queryField.text = ""; killSearch() }
   }
 
   visible: true
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  // --- status probe: {"installed": bool, "authed": bool}, no network -----
-
+  // Status probe: {"installed": bool, "authed": bool} — no network.
   Process {
     id: statusProc
     command: [root.py, root.pluginRoot + "/bin/pplx_status.py"]
@@ -139,21 +135,10 @@ Panel {
     onExited: statusDeadline.stop()
   }
 
-  // Hard whole-job deadline: pplx_status.py/pplx_search.py both call
-  // os.setsid() and keep helpers in their own session group, so a
-  // group-kill reaches the whole tree even if Python is stuck inside a
-  // helper wait.
   Timer {
     id: statusDeadline
     interval: 8000
-    onTriggered: {
-      if (statusProc.running) {
-        var pid = statusProc.pid
-        if (pid > 0)
-          Quickshell.execDetached(["/usr/bin/kill", "-KILL", "--", "-" + pid.toString()])
-        statusProc.signal(9)
-      }
-    }
+    onTriggered: root.groupKill(statusProc)
   }
 
   Timer {
@@ -165,9 +150,8 @@ Panel {
     onTriggered: root.refreshStatus()
   }
 
-  // --- search: {"ok","needs_key","installed","hits":[...],"error",
-  //     "elapsed_ms"} — spawned only on an explicit user submit ---------
-
+  // Search: {"ok","needs_key","installed","hits":[{title,url,domain,
+  // snippet,date}],"error","elapsed_ms"} — spawned only on submit.
   Process {
     id: searchProc
     command: [root.py, root.pluginRoot + "/bin/pplx_search.py"]
@@ -211,24 +195,17 @@ Panel {
         }
       }
     }
-    onExited: {
-      searchDeadline.stop()
-      root.isSearching = false
-    }
+    onExited: { searchDeadline.stop(); root.isSearching = false }
   }
 
   Timer {
     id: searchDeadline
+    // Helper's own backstop is JOB_DEADLINE_S=15s; watchdog gets slack above it.
     interval: 17000
     onTriggered: {
-      if (searchProc.running) {
-        var pid = searchProc.pid
-        if (pid > 0)
-          Quickshell.execDetached(["/usr/bin/kill", "-KILL", "--", "-" + pid.toString()])
-        searchProc.signal(9)
-        root.isSearching = false
-        root.lastError = "search timed out"
-      }
+      root.groupKill(searchProc)
+      root.isSearching = false
+      root.lastError = "search timed out"
     }
   }
 
@@ -240,10 +217,7 @@ Panel {
     tooltipText: "pplx · Perplexity Search"
     // Paints the glyph in the urgent color while the tool can't search.
     active: root.statusKnown && (!root.installed || !root.authed)
-    onPressed: function (b) {
-      root.refreshStatus()
-      root.toggle()
-    }
+    onPressed: function (b) { root.refreshStatus(); root.toggle() }
   }
 
   KeyboardPanel {
@@ -257,22 +231,12 @@ Panel {
     contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, 620)
 
     PanelKeyCatcher {
-      id: keyCatcher
       anchors.fill: parent
       // While the query editor holds focus every key belongs to it —
-      // Enter and Escape are handled inside the TextInput itself.
+      // Enter submits and Escape closes inside the TextInput itself.
       blocked: queryField.activeFocus
       onCloseRequested: root.close()
-      onActivateRequested: {
-        if (queryField.text.trim().length > 0) root.submitQuery()
-        else if (root.installed) queryField.forceActiveFocus()
-      }
-      onMoveRequested: function (dx, dy) {
-        if (dy !== 0 && resultsFlick.visible) {
-          var maxY = Math.max(0, resultsFlick.contentHeight - resultsFlick.height)
-          resultsFlick.contentY = Math.max(0, Math.min(maxY, resultsFlick.contentY + dy * Style.space(56)))
-        }
-      }
+      onActivateRequested: if (queryField.text.trim().length > 0) root.submitQuery()
       onTabRequested: function (direction) { root.switchPanel(direction) }
 
       Column {
@@ -295,18 +259,11 @@ Panel {
             anchors.rightMargin: 16
             spacing: 12
 
-            Rectangle {
-              width: 36
-              height: 36
-              radius: 8
-              color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.2)
-              Text {
-                textFormat: Text.PlainText
-                anchors.centerIn: parent
-                text: "󰍉"
-                color: root.accent
-                font.pixelSize: 20
-              }
+            Text {
+              textFormat: Text.PlainText
+              text: "󰍉"
+              color: root.accent
+              font.pixelSize: 24
             }
 
             Column {
@@ -333,24 +290,15 @@ Panel {
               width: Math.max(64, pillText.implicitWidth + 18)
               radius: 11
               color: Qt.rgba(root.statusColor.r, root.statusColor.g, root.statusColor.b, 0.15)
-              RowLayout {
+              Text {
+                textFormat: Text.PlainText
+                id: pillText
                 anchors.centerIn: parent
-                spacing: 6
-                Rectangle {
-                  width: 6
-                  height: 6
-                  radius: 3
-                  color: root.statusColor
-                  opacity: root.isSearching || !root.statusKnown ? root.animPulse : 1.0
-                }
-                Text {
-                  textFormat: Text.PlainText
-                  id: pillText
-                  text: root.statusText
-                  color: root.statusColor
-                  font.pixelSize: 9
-                  font.bold: true
-                }
+                text: root.statusText
+                color: root.statusColor
+                font.pixelSize: 9
+                font.bold: true
+                opacity: (root.isSearching || !root.statusKnown) ? root.animPulse : 1.0
               }
             }
           }
@@ -366,20 +314,10 @@ Panel {
           border.color: queryField.activeFocus ? root.accent : root.cardBorder
           border.width: 1
 
-          Text {
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.leftMargin: 12
-            anchors.verticalCenter: parent.verticalCenter
-            text: "󰍉"
-            color: root.muted
-            font.pixelSize: 14
-          }
-
           TextInput {
             id: queryField
             anchors.fill: parent
-            anchors.leftMargin: 34
+            anchors.leftMargin: 12
             anchors.rightMargin: 10
             verticalAlignment: TextInput.AlignVCenter
             clip: true
@@ -387,18 +325,8 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.body
             selectByMouse: true
-            selectionColor: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.35)
-            selectedTextColor: root.fg
-
-            Keys.onPressed: function (event) {
-              if (event.key === Qt.Key_Escape) {
-                root.close()
-                event.accepted = true
-              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                root.submitQuery()
-                event.accepted = true
-              }
-            }
+            onAccepted: root.submitQuery()
+            Keys.onEscapePressed: root.close()
 
             Text {
               anchors.left: parent.left
@@ -414,24 +342,14 @@ Panel {
           }
         }
 
-        // Indeterminate "searching" line
-        Row {
+        // Indeterminate "…" line while a search is in flight
+        Text {
           visible: root.isSearching
-          spacing: 8
-          Rectangle {
-            width: 6
-            height: 6
-            radius: 3
-            anchors.verticalCenter: parent.verticalCenter
-            color: root.accent
-            opacity: root.animPulse
-          }
-          Text {
-            text: "Searching…"
-            textFormat: Text.PlainText
-            color: root.muted
-            font.pixelSize: Style.font.bodySmall
-          }
+          text: "Searching…"
+          textFormat: Text.PlainText
+          color: root.muted
+          font.pixelSize: Style.font.bodySmall
+          opacity: root.animPulse
         }
 
         // Error line — hidden while a state pane is already explaining
@@ -445,25 +363,26 @@ Panel {
           wrapMode: Text.Wrap
         }
 
-        // Setup pane: pplx CLI missing
+        // State pane: setup when pplx missing, key-setup when no key —
+        // one card, conditional copy.
         Rectangle {
-          visible: root.statusKnown && !root.installed
+          visible: root.statusKnown && (!root.installed || !root.authed)
           width: parent.width
-          height: setupColumn.implicitHeight + 24
+          height: stateColumn.implicitHeight + 24
           radius: 8
           color: root.cardBg
           border.color: root.cardBorder
           border.width: 1
 
           Column {
-            id: setupColumn
+            id: stateColumn
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
             anchors.margins: 12
             spacing: 4
             Text {
-              text: "pplx CLI not found"
+              text: !root.installed ? "pplx CLI not found" : "No Perplexity API key"
               textFormat: Text.PlainText
               color: root.fg
               font.pixelSize: Style.font.bodySmall
@@ -471,7 +390,9 @@ Panel {
             }
             Text {
               width: parent.width
-              text: "Install pplx from github.com/perplexityai/perplexity-cli releases"
+              text: !root.installed
+                  ? "Install pplx from github.com/perplexityai/perplexity-cli releases"
+                  : "Set PERPLEXITY_API_KEY, or: omaseal set perplexity api-key"
               textFormat: Text.PlainText
               color: root.muted
               font.pixelSize: Style.font.bodySmall
@@ -480,54 +401,21 @@ Panel {
           }
         }
 
-        // Key-setup pane: installed but no API key resolves
-        Rectangle {
-          visible: root.installed && !root.authed
-          width: parent.width
-          height: keyColumn.implicitHeight + 24
-          radius: 8
-          color: root.cardBg
-          border.color: root.cardBorder
-          border.width: 1
-
-          Column {
-            id: keyColumn
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: 12
-            spacing: 4
-            Text {
-              text: "No Perplexity API key"
-              textFormat: Text.PlainText
-              color: root.fg
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-            }
-            Text {
-              width: parent.width
-              text: "Set PERPLEXITY_API_KEY, or: omaseal set perplexity api-key"
-              textFormat: Text.PlainText
-              color: root.muted
-              font.pixelSize: Style.font.bodySmall
-              wrapMode: Text.Wrap
-            }
-          }
-        }
-
-        // Result count + latency line
+        // Count + latency line; doubles as the empty-result state
         Text {
+          visible: root.hasSearched && !root.isSearching && root.lastError === ""
+              && root.installed && root.authed
+          width: parent.width
+          text: root.hits.length > 0
+              ? root.hits.length + " hits · " + root.elapsedMs + " ms"
+              : "No results."
           textFormat: Text.PlainText
-          visible: root.hits.length > 0
-          text: root.hits.length + " hits · " + root.elapsedMs + " ms"
           color: root.muted
           font.pixelSize: 10
-          font.bold: true
         }
 
         // Results list
         Flickable {
-          id: resultsFlick
           visible: root.hits.length > 0
           width: parent.width
           height: Math.min(Style.space(400), resultsColumn.implicitHeight)
@@ -535,7 +423,6 @@ Panel {
           contentHeight: resultsColumn.implicitHeight
           clip: true
           boundsBehavior: Flickable.StopAtBounds
-          flickableDirection: Flickable.VerticalFlick
           interactive: contentHeight > height
 
           Column {
@@ -604,17 +491,6 @@ Panel {
               }
             }
           }
-        }
-
-        // Empty-result state after a completed, error-free search
-        Text {
-          visible: root.hasSearched && !root.isSearching && root.lastError === ""
-              && root.hits.length === 0 && root.installed && root.authed
-          width: parent.width
-          text: "No results."
-          textFormat: Text.PlainText
-          color: root.muted
-          font.pixelSize: Style.font.bodySmall
         }
       }
     }
