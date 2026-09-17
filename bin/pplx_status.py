@@ -1,23 +1,40 @@
 #!/usr/bin/python3
 """Lightweight pplx status probe for the io.github.duketopceo.pplx bar icon.
 
-Emits {"installed": bool, "authed": bool} on stdout. "authed" means an API
-key resolves locally — PERPLEXITY_API_KEY, or the optional omaseal keyring
-(`omaseal resolve omaseal://perplexity/api-key`). No network call is made
-and the key value is never printed, logged, or placed on argv.
+Emits {"installed": bool, "authed": bool, "history": [...]} on stdout.
+"authed" means an API key resolves locally — PERPLEXITY_API_KEY, or the
+optional omaseal keyring (`omaseal get omaseal://perplexity/default`).
+No network call is made and the key value is never printed, logged, or
+placed on argv. "history" is the local query journal written by
+pplx_search.py (~/.local/state/omarchy/pplx/history.json), re-emitted
+newest-first (max 30) for the panel's History tab.
 
 Hardening mirrors pplx_search.py / probe_nexus.py: fixed tool-lookup path,
 minimal fixed child env, byte caps and deadline, process-group kill on
-timeout, SIGALRM/setsid backstop. No shell, no writes.
+timeout, SIGALRM/setsid backstop. No shell, no writes — the history file
+is opened descriptor-relative and read-capped like the standby/bumblebee
+cache readers.
 """
-import json, os, selectors, shutil, signal, subprocess, sys, time
+import json, os, selectors, shutil, signal, stat, subprocess, sys, time
+from pathlib import Path
 
 JOB_DEADLINE_S = 5
 OMASEAL_TIMEOUT_S = 2.0    # keyring resolve can block on a prompt — keep tight
 MAX_ERR_BYTES = 16384
 OMASEAL_CAP = 4096
 MAX_KEY = 256
-OMASEAL_REF = "omaseal://perplexity/api-key"
+OMASEAL_REF = "omaseal://perplexity/default"
+
+try:
+    HOME = Path.home()
+except Exception:
+    HOME = Path("/")
+HISTORY_DIR_REL = ".local/state/omarchy/pplx"
+HISTORY_NAME = "history.json"
+HISTORY_MAX_BYTES = 64 * 1024   # bounds a hostile/corrupt file
+MAX_HISTORY = 30
+MAX_HISTORY_QUERY = 120
+MAX_HISTORY_AT = 64
 
 SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # pplx's installer and omaseal both target ~/.local/bin. TOOL_PATH is still a
@@ -133,6 +150,81 @@ def _run(argv, timeout=2.0, cap=OMASEAL_CAP, extra_env=None):
     return res
 
 
+# --- history read: descriptor-relative, capped (standby/bumblebee pattern) ---
+
+def _open_dir(path):
+    """Descriptor for a directory — no symlinks, must be ours."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        raise PermissionError("%s is not a user-owned real directory" % path)
+    return fd
+
+
+def _read_capped(dirfd, name, limit):
+    """Bounded, no-follow, regular-file read; None on any anomaly."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_size > limit:
+            return None
+        return os.read(fd, limit)
+    finally:
+        os.close(fd)
+
+
+def _history_entry(raw):
+    """Normalize one journal entry for the panel; None to drop it."""
+    if not isinstance(raw, dict):
+        return None
+    query = raw.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return None
+    hits_count = raw.get("hits_count")
+    elapsed_ms = raw.get("elapsed_ms")
+    at = raw.get("at")
+    return {
+        "query": query[:MAX_HISTORY_QUERY],
+        "hits_count": hits_count if isinstance(hits_count, int) and hits_count >= 0 else 0,
+        "elapsed_ms": elapsed_ms if isinstance(elapsed_ms, int) and elapsed_ms >= 0 else 0,
+        "at": at[:MAX_HISTORY_AT] if isinstance(at, str) else "",
+    }
+
+
+def _read_history(state_dir=None):
+    """Newest-first entry list (max MAX_HISTORY); [] on missing/corrupt."""
+    try:
+        state_dir = (Path(state_dir) if state_dir is not None
+                     else HOME / HISTORY_DIR_REL)
+        dirfd = _open_dir(state_dir)
+    except (OSError, PermissionError):
+        return []
+    try:
+        raw = _read_capped(dirfd, HISTORY_NAME, HISTORY_MAX_BYTES)
+    finally:
+        os.close(dirfd)
+    if raw is None:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for entry in data:
+        clean = _history_entry(entry)
+        if clean is not None:
+            out.append(clean)
+        if len(out) >= MAX_HISTORY:
+            break
+    return out
+
+
 def _resolve_key(environ=None, run=None, tool=None):
     """Return the API key (str) or None — env first, then omaseal.
 
@@ -147,7 +239,7 @@ def _resolve_key(environ=None, run=None, tool=None):
     omaseal = tool("omaseal")
     if not omaseal:
         return None
-    res = run([omaseal, "resolve", OMASEAL_REF],
+    res = run([omaseal, "get", OMASEAL_REF],
               timeout=OMASEAL_TIMEOUT_S, cap=OMASEAL_CAP)
     if res.get("rc") == 0 and not res.get("timeout") and not res.get("overflow"):
         for line in (res.get("out") or "").splitlines():
@@ -157,14 +249,17 @@ def _resolve_key(environ=None, run=None, tool=None):
     return None
 
 
-def status(environ=None, run=None, tool=None):
-    """{"installed": bool, "authed": bool} — no API call, all seams injectable."""
+def status(environ=None, run=None, tool=None, state_dir=None):
+    """{"installed","authed","history"} — no API call, all seams injectable."""
     run = _run if run is None else run
     tool = _tool if tool is None else tool
     installed = tool("pplx") is not None
     authed = bool(installed and
                   _resolve_key(environ=environ, run=run, tool=tool))
-    return {"installed": installed, "authed": authed}
+    # The journal outlives installs: read it even when pplx is gone so the
+    # History tab still shows past queries.
+    return {"installed": installed, "authed": authed,
+            "history": _read_history(state_dir)}
 
 
 def main():

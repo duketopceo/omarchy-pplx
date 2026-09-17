@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -16,16 +15,25 @@ Panel {
   property bool hasSearched: false
   property bool isSearching: false
   property var hits: []
+  property var history: []
   property string lastError: ""
   property int elapsedMs: 0
+  property string currentTab: "ask" // "ask" | "history"
+  // The draft lives on root, not in the editor: the Loader destroys the Ask
+  // tab's item on every switch, and the draft is what a History row writes
+  // into to stage a re-ask.
+  property string draft: ""
   property real animPulse: 0.0
 
-  readonly property color fg: bar ? bar.foreground : Color.foreground
+  readonly property bool ready: installed && authed
+
+  // Palette — dayflow idiom: theme tokens plus derived alpha fills, no
+  // hardcoded colors anywhere in the panel.
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property color urgent: Color.urgent
   readonly property color accent: Color.accent
-  readonly property color muted: Color.muted
-  readonly property color cardBg: Qt.rgba(fg.r, fg.g, fg.b, 0.04)
-  readonly property color cardBorder: Qt.rgba(fg.r, fg.g, fg.b, 0.08)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string pluginRoot: {
     var p = Qt.resolvedUrl(".").toString()
     if (p.indexOf("file://") === 0) p = p.substring(7)
@@ -34,7 +42,46 @@ Panel {
   }
 
   readonly property string statusText: !statusKnown ? "CHECKING" : !installed ? "NOT INSTALLED" : !authed ? "NO KEY" : "READY"
-  readonly property color statusColor: !statusKnown ? muted : (installed && authed ? accent : urgent)
+  readonly property color statusColor: !statusKnown ? dim : !installed ? dim : !authed ? urgent : accent
+
+  function _rgb(c) {
+    if (typeof c === "string") {
+      var h = c.charAt(0) === "#" ? c.substring(1) : c
+      if (h.length === 8) h = h.substring(0, 6)
+      if (h.length === 3)
+        h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2)
+      if (h.length === 6)
+        return [parseInt(h.substring(0, 2), 16) / 255,
+                parseInt(h.substring(2, 4), 16) / 255,
+                parseInt(h.substring(4, 6), 16) / 255]
+      return [1, 1, 1]
+    }
+    if (c === undefined || c === null) return [1, 1, 1]
+    return [c.r, c.g, c.b]
+  }
+
+  function fillFor(c, alpha) {
+    var rgb = _rgb(c)
+    return Qt.rgba(rgb[0], rgb[1], rgb[2], alpha)
+  }
+  function accentFill(alpha) {
+    var c = (Color.accent === undefined || Color.accent === null) ? foreground : Color.accent
+    return fillFor(c, alpha)
+  }
+  function fgFill(alpha) { return fillFor(foreground, alpha) }
+
+  // "42s ago" / "3m ago" for history rows; "" on an unparseable stamp.
+  function relTime(iso) {
+    var t = new Date(String(iso || "")).getTime()
+    if (isNaN(t)) return ""
+    var s = Math.max(0, Math.floor((Date.now() - t) / 1000))
+    if (s < 60) return s + "s ago"
+    var m = Math.floor(s / 60)
+    if (m < 60) return m + "m ago"
+    var h = Math.floor(m / 60)
+    if (h < 24) return h + "h ago"
+    return Math.floor(h / 24) + "d ago"
+  }
 
   // Absolute interpreter + minimal env: a PATH-preceding shadow "python3"
   // must never run here. HOME passes through so the helpers' omaseal
@@ -52,12 +99,17 @@ Panel {
   })
 
   NumberAnimation on animPulse {
-    from: 0.3
-    to: 1.0
-    duration: 1400
+    from: 0.3; to: 1.0; duration: 1400
     loops: Animation.Infinite
     running: root.opened
     easing.type: Easing.InOutSine
+  }
+
+  // The quick-ask editor is inside the askTab component — reach it through
+  // the Loader instead of by id.
+  function askField() {
+    var it = tabLoader.item
+    return (it && it.askField) ? it.askField : null
   }
 
   // Both helpers os.setsid() into their own session group, so a
@@ -78,7 +130,7 @@ Panel {
   }
 
   function submitQuery() {
-    var q = queryField.text.trim()
+    var q = draft.trim()
     if (q.length === 0 || searchProc.running) return
     hits = []
     lastError = ""
@@ -103,16 +155,34 @@ Panel {
     Quickshell.execDetached(["/usr/bin/xdg-open", url])
   }
 
-  onOpenedChanged: {
-    if (opened) refreshStatus()
-    else { queryField.text = ""; killSearch() }
+  // History row click: stage the query into the Ask editor — a re-ask is a
+  // deliberate second Enter, never an implicit side effect.
+  function reuseQuery(q) {
+    draft = String(q || "")
+    currentTab = "ask"
+    Qt.callLater(function() {
+      var f = askField()
+      if (f) f.forceActiveFocus()
+    })
   }
+
+  onOpenedChanged: {
+    if (opened) { refreshStatus(); return }
+    draft = ""
+    var f = askField()
+    if (f) f.text = ""
+    killSearch()
+  }
+
+  // History rides along in the status payload — re-poll when the tab opens
+  // so the list is never a poll interval stale.
+  onCurrentTabChanged: if (currentTab === "history") refreshStatus()
 
   visible: true
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  // Status probe: {"installed": bool, "authed": bool} — no network.
+  // Status probe: {"installed","authed","history"} — no network.
   Process {
     id: statusProc
     command: [root.py, root.pluginRoot + "/bin/pplx_status.py"]
@@ -128,6 +198,7 @@ Panel {
           var data = JSON.parse(text)
           root.installed = !!data.installed
           root.authed = !!data.authed
+          root.history = (Array.isArray(data.history) ? data.history : []).slice(0, 30)
           root.statusKnown = true
         } catch (e) {}
       }
@@ -135,18 +206,13 @@ Panel {
     onExited: statusDeadline.stop()
   }
 
-  Timer {
-    id: statusDeadline
-    interval: 8000
-    onTriggered: root.groupKill(statusProc)
-  }
-
+  // Hard deadlines: a stuck helper is group-killed, never left running past
+  // one poll interval.
+  Timer { id: statusDeadline; interval: 8000; onTriggered: root.groupKill(statusProc) }
   Timer {
     id: statusTimer
     interval: 30000
-    running: true
-    repeat: true
-    triggeredOnStart: true
+    running: true; repeat: true; triggeredOnStart: true
     onTriggered: root.refreshStatus()
   }
 
@@ -184,6 +250,7 @@ Panel {
             root.hits = (data.hits || []).slice(0, 8)
             root.elapsedMs = Number(data.elapsed_ms) || 0
             root.lastError = ""
+            root.refreshStatus() // pull the journaled entry into History
           } else {
             root.hits = []
             root.lastError = (typeof data.error === "string" && data.error.length > 0)
@@ -226,166 +293,104 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: queryField
-    contentWidth: panel.fittedContentWidth(Style.space(440), 500)
-    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, 620)
+    focusTarget: { var f = root.askField(); return (root.currentTab === "ask" && f) ? f : keyCatcher }
+    contentWidth: panel.fittedContentWidth(Style.space(500), 540)
+    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, 640)
 
     PanelKeyCatcher {
+      id: keyCatcher
       anchors.fill: parent
       // While the query editor holds focus every key belongs to it —
       // Enter submits and Escape closes inside the TextInput itself.
-      blocked: queryField.activeFocus
+      blocked: { var f = root.askField(); return !!f && f.activeFocus }
       onCloseRequested: root.close()
-      onActivateRequested: if (queryField.text.trim().length > 0) root.submitQuery()
+      onActivateRequested: if (root.currentTab === "ask" && root.draft.trim().length > 0) root.submitQuery()
       onTabRequested: function (direction) { root.switchPanel(direction) }
 
       Column {
         id: mainColumn
         width: parent.width
-        spacing: Style.space(12)
+        spacing: Style.space(10)
 
-        // Header card: title + status pill
-        Rectangle {
+        // ---- header ----
+        Row {
           width: parent.width
-          height: 64
-          radius: 10
-          color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.08)
-          border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.25)
-          border.width: 1
+          spacing: Style.space(10)
 
-          RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: 16
-            anchors.rightMargin: 16
-            spacing: 12
+          Rectangle {
+            id: iconTile
+            width: Style.space(34); height: Style.space(34)
+            radius: Style.cornerRadius
+            color: root.accentFill(0.12)
+            anchors.verticalCenter: parent.verticalCenter
 
             Text {
-              textFormat: Text.PlainText
-              text: "󰍉"
+              anchors.centerIn: parent
+              text: "󰍉"; textFormat: Text.PlainText
               color: root.accent
-              font.pixelSize: 24
-            }
-
-            Column {
-              Layout.fillWidth: true
-              spacing: 2
-              Text {
-                textFormat: Text.PlainText
-                text: "PERPLEXITY SEARCH"
-                color: root.fg
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.body
-                font.bold: true
-              }
-              Text {
-                textFormat: Text.PlainText
-                text: "Quick-ask web answers via the pplx CLI"
-                color: root.muted
-                font.pixelSize: 10
-              }
-            }
-
-            Rectangle {
-              height: 22
-              width: Math.max(64, pillText.implicitWidth + 18)
-              radius: 11
-              color: Qt.rgba(root.statusColor.r, root.statusColor.g, root.statusColor.b, 0.15)
-              Text {
-                textFormat: Text.PlainText
-                id: pillText
-                anchors.centerIn: parent
-                text: root.statusText
-                color: root.statusColor
-                font.pixelSize: 9
-                font.bold: true
-                opacity: (root.isSearching || !root.statusKnown) ? root.animPulse : 1.0
-              }
+              font.family: root.fontFamily; font.pixelSize: Style.font.iconLarge
             }
           }
-        }
 
-        // Quick-ask row: single-line editor; Enter submits, Escape closes
-        Rectangle {
-          visible: root.installed
-          width: parent.width
-          height: Style.space(36)
-          radius: 8
-          color: root.cardBg
-          border.color: queryField.activeFocus ? root.accent : root.cardBorder
-          border.width: 1
-
-          TextInput {
-            id: queryField
-            anchors.fill: parent
-            anchors.leftMargin: 12
-            anchors.rightMargin: 10
-            verticalAlignment: TextInput.AlignVCenter
-            clip: true
-            color: root.fg
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.body
-            selectByMouse: true
-            onAccepted: root.submitQuery()
-            Keys.onEscapePressed: root.close()
+          Column {
+            width: parent.width - iconTile.width - statusPill.width - parent.spacing * 2
+            spacing: Style.space(2)
+            anchors.verticalCenter: parent.verticalCenter
 
             Text {
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              visible: queryField.text.length === 0
-              text: "Ask anything…"
-              textFormat: Text.PlainText
-              color: root.muted
-              font: queryField.font
+              text: "pplx"; textFormat: Text.PlainText
+              color: root.foreground
+              font.family: root.fontFamily; font.pixelSize: Style.font.subtitle
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              text: "grounded perplexity search"; textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily; font.pixelSize: Style.font.caption
               elide: Text.ElideRight
             }
           }
+
+          Rectangle {
+            id: statusPill
+            height: Style.space(22)
+            width: pillText.implicitWidth + Style.space(16)
+            radius: height / 2
+            color: root.fillFor(root.statusColor, 0.15)
+            anchors.verticalCenter: parent.verticalCenter
+
+            Text {
+              id: pillText
+              anchors.centerIn: parent
+              text: root.statusText; textFormat: Text.PlainText
+              color: root.statusColor
+              font.family: root.fontFamily; font.pixelSize: Style.font.caption
+              font.bold: true
+              opacity: (root.isSearching || !root.statusKnown) ? root.animPulse : 1.0
+            }
+          }
         }
 
-        // Indeterminate "…" line while a search is in flight
-        Text {
-          visible: root.isSearching
-          text: "Searching…"
-          textFormat: Text.PlainText
-          color: root.muted
-          font.pixelSize: Style.font.bodySmall
-          opacity: root.animPulse
-        }
-
-        // Error line — hidden while a state pane is already explaining
-        Text {
-          visible: root.lastError !== "" && !root.isSearching && root.installed && root.authed
-          width: parent.width
-          text: root.lastError
-          textFormat: Text.PlainText
-          color: root.urgent
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.Wrap
-        }
-
-        // State pane: setup when pplx missing, key-setup when no key —
-        // one card, conditional copy.
+        // ---- setup pane: one bordered card, conditional copy ----
         Rectangle {
-          visible: root.statusKnown && (!root.installed || !root.authed)
+          visible: root.statusKnown && !root.ready
           width: parent.width
-          height: stateColumn.implicitHeight + 24
-          radius: 8
-          color: root.cardBg
-          border.color: root.cardBorder
-          border.width: 1
+          height: stateColumn.implicitHeight + Style.space(24)
+          radius: Style.cornerRadius
+          color: root.fgFill(0.04)
+          border.color: root.fgFill(0.10); border.width: 1
 
           Column {
             id: stateColumn
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: 12
-            spacing: 4
+            anchors { left: parent.left; right: parent.right; top: parent.top; margins: Style.space(12) }
+            spacing: Style.space(4)
+
             Text {
               text: !root.installed ? "pplx CLI not found" : "No Perplexity API key"
               textFormat: Text.PlainText
-              color: root.fg
-              font.pixelSize: Style.font.bodySmall
+              color: root.foreground
+              font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
               font.bold: true
             }
             Text {
@@ -394,100 +399,319 @@ Panel {
                   ? "Install pplx from github.com/perplexityai/perplexity-cli releases"
                   : "Set PERPLEXITY_API_KEY, or: omaseal set perplexity api-key"
               textFormat: Text.PlainText
-              color: root.muted
-              font.pixelSize: Style.font.bodySmall
+              color: root.dim
+              font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
               wrapMode: Text.Wrap
             }
           }
         }
 
-        // Count + latency line; doubles as the empty-result state
-        Text {
-          visible: root.hasSearched && !root.isSearching && root.lastError === ""
-              && root.installed && root.authed
+        // ---- tab bar ----
+        Row {
           width: parent.width
-          text: root.hits.length > 0
-              ? root.hits.length + " hits · " + root.elapsedMs + " ms"
-              : "No results."
-          textFormat: Text.PlainText
-          color: root.muted
-          font.pixelSize: 10
+          spacing: Style.space(6)
+
+          Repeater {
+            model: ["ask", "history"]
+            delegate: Rectangle {
+              height: Style.space(28)
+              width: tabLabel.implicitWidth + Style.space(16)
+              radius: Style.cornerRadius
+              color: root.currentTab === modelData ? root.accentFill(0.12)
+                  : (tabMouse.containsMouse ? root.accentFill(0.06) : "transparent")
+              border.color: root.currentTab === modelData ? root.accentFill(0.45) : "transparent"
+
+              Text {
+                id: tabLabel
+                anchors.centerIn: parent
+                text: modelData.charAt(0).toUpperCase() + modelData.slice(1)
+                textFormat: Text.PlainText
+                color: root.currentTab === modelData ? root.foreground : root.dim
+                font.bold: root.currentTab === modelData
+                font.family: root.fontFamily; font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: tabMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.currentTab = modelData
+              }
+            }
+          }
         }
 
-        // Results list
-        Flickable {
-          visible: root.hits.length > 0
+        PanelSeparator { foreground: root.foreground }
+
+        // ---- tab content ----
+        Loader {
+          id: tabLoader
           width: parent.width
-          height: Math.min(Style.space(400), resultsColumn.implicitHeight)
-          contentWidth: width
-          contentHeight: resultsColumn.implicitHeight
+          height: item ? item.implicitHeight : Style.space(60)
+          sourceComponent: root.currentTab === "ask" ? askTab : historyTab
+        }
+      }
+    }
+  }
+
+  // ---- Ask tab ----
+  Component {
+    id: askTab
+
+    Column {
+      property alias askField: queryField
+      width: parent.width
+      spacing: Style.space(10)
+      Component.onCompleted: queryField.text = root.draft
+
+      // Quick-ask row: single-line editor; Enter submits, Escape closes.
+      // Every keystroke mirrors into root.draft so a tab switch (which
+      // destroys this item) or a panel close (which clears the draft)
+      // never strands half a query.
+      Rectangle {
+        visible: root.ready
+        width: parent.width
+        height: Style.space(36)
+        radius: Style.cornerRadius
+        color: root.fgFill(0.04)
+        border.color: queryField.activeFocus ? root.accentFill(0.5) : root.fgFill(0.10)
+        border.width: 1
+
+        TextInput {
+          id: queryField
+          anchors { fill: parent; leftMargin: Style.space(12); rightMargin: Style.space(10) }
+          verticalAlignment: TextInput.AlignVCenter
           clip: true
-          boundsBehavior: Flickable.StopAtBounds
-          interactive: contentHeight > height
+          color: root.foreground
+          font.family: root.fontFamily; font.pixelSize: Style.font.body
+          selectByMouse: true
+          onAccepted: root.submitQuery()
+          Keys.onEscapePressed: root.close()
+          onTextChanged: root.draft = text
 
-          Column {
-            id: resultsColumn
-            width: parent.width
-            spacing: Style.space(8)
+          Text {
+            anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter }
+            visible: queryField.text.length === 0
+            text: "Ask anything…"; textFormat: Text.PlainText
+            color: root.dim
+            font: queryField.font
+            elide: Text.ElideRight
+          }
+        }
+      }
 
-            Repeater {
-              model: root.hits
-              delegate: Rectangle {
-                width: resultsColumn.width
-                height: hitColumn.implicitHeight + 16
-                radius: 8
-                color: root.cardBg
-                border.color: hitArea.containsMouse
-                    ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.4)
-                    : root.cardBorder
-                border.width: 1
+      // Indeterminate pulse while a search is in flight.
+      Text {
+        visible: root.isSearching
+        text: "Searching…"; textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+        opacity: root.animPulse
+      }
 
-                Column {
-                  id: hitColumn
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.top: parent.top
-                  anchors.margins: 8
-                  spacing: 2
+      // Error banner.
+      Text {
+        visible: root.lastError !== "" && !root.isSearching
+        width: parent.width
+        text: "! " + root.lastError; textFormat: Text.PlainText
+        color: root.urgent
+        font.family: root.fontFamily; font.pixelSize: Style.font.body
+        wrapMode: Text.WordWrap
+      }
 
-                  Text {
-                    width: parent.width
-                    text: modelData.title
-                    textFormat: Text.PlainText
-                    color: root.fg
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                    elide: Text.ElideRight
-                  }
-                  Text {
-                    width: parent.width
-                    text: modelData.domain + (modelData.date ? " · " + modelData.date : "")
-                    textFormat: Text.PlainText
-                    color: root.muted
-                    font.pixelSize: 10
-                    elide: Text.ElideRight
-                  }
-                  Text {
-                    visible: modelData.snippet !== ""
-                    width: parent.width
-                    text: modelData.snippet
-                    textFormat: Text.PlainText
-                    color: root.muted
-                    font.pixelSize: 10
-                    wrapMode: Text.Wrap
-                    maximumLineCount: 3
-                    elide: Text.ElideRight
+      // Count + latency line; doubles as the empty-result state.
+      Text {
+        visible: root.hasSearched && !root.isSearching && root.lastError === "" && root.ready
+        width: parent.width
+        text: root.hits.length > 0
+            ? root.hits.length + " hits · " + root.elapsedMs + " ms" : "No results."
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily; font.pixelSize: Style.font.caption
+      }
+
+      // Result cards.
+      Flickable {
+        visible: root.hits.length > 0
+        width: parent.width
+        height: Math.min(Style.space(400), resultsColumn.implicitHeight)
+        contentWidth: width
+        contentHeight: resultsColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
+
+        Column {
+          id: resultsColumn
+          width: parent.width
+          spacing: Style.space(8)
+
+          Repeater {
+            model: root.hits
+            delegate: Rectangle {
+              width: resultsColumn.width
+              height: hitColumn.implicitHeight + Style.space(16)
+              radius: Style.cornerRadius
+              color: root.fgFill(0.04)
+              border.color: hitArea.containsMouse ? root.accentFill(0.4) : root.fgFill(0.08)
+              border.width: 1
+
+              Column {
+                id: hitColumn
+                anchors { left: parent.left; right: parent.right; top: parent.top; margins: Style.space(8) }
+                spacing: Style.space(4)
+
+                // Domain chip left, date right.
+                Item {
+                  visible: modelData.domain !== "" || modelData.date !== ""
+                  width: parent.width
+                  height: Style.space(18)
+
+                  Rectangle {
+                    id: domainChip
+                    visible: modelData.domain !== ""
+                    anchors.left: parent.left
+                    height: Style.space(18)
+                    width: Math.max(Style.space(20),
+                           Math.min(parent.width - Style.space(70),
+                                    domainLabel.implicitWidth + Style.space(10)))
+                    radius: Style.space(4)
+                    color: root.fgFill(0.09)
                     clip: true
+
+                    Text {
+                      id: domainLabel
+                      anchors.centerIn: parent
+                      width: parent.width - Style.space(10)
+                      text: modelData.domain; textFormat: Text.PlainText
+                      color: root.dim
+                      font.family: root.fontFamily; font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+
+                  Text {
+                    anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                    visible: modelData.date !== ""
+                    text: modelData.date; textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily; font.pixelSize: Style.font.caption
                   }
                 }
 
-                MouseArea {
-                  id: hitArea
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.openHit(modelData.url)
+                Text {
+                  width: parent.width
+                  text: modelData.title; textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  elide: Text.ElideRight
                 }
+
+                Text {
+                  visible: modelData.snippet !== ""
+                  width: parent.width
+                  text: modelData.snippet; textFormat: Text.PlainText
+                  color: root.dim
+                  font.family: root.fontFamily; font.pixelSize: Style.font.caption
+                  wrapMode: Text.Wrap
+                  maximumLineCount: 3
+                  elide: Text.ElideRight
+                  clip: true
+                }
+              }
+
+              MouseArea {
+                id: hitArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openHit(modelData.url)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ---- History tab ----
+  Component {
+    id: historyTab
+
+    Column {
+      width: parent.width
+      spacing: Style.space(8)
+
+      PanelSectionHeader {
+        text: "RECENT QUERIES"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
+
+      Text {
+        visible: root.history.length === 0
+        width: parent.width
+        text: "No searches yet"; textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily; font.pixelSize: Style.font.caption
+      }
+
+      Flickable {
+        visible: root.history.length > 0
+        width: parent.width
+        height: Math.min(Style.space(400), historyRows.implicitHeight)
+        contentWidth: width
+        contentHeight: historyRows.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
+
+        Column {
+          id: historyRows
+          width: parent.width
+          spacing: Style.space(2)
+
+          Repeater {
+            model: root.history
+            delegate: Rectangle {
+              width: historyRows.width
+              height: histColumn.implicitHeight + Style.space(12)
+              radius: Style.cornerRadius
+              color: histMouse.containsMouse ? root.fgFill(0.05) : "transparent"
+
+              Column {
+                id: histColumn
+                anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter
+                          leftMargin: Style.space(8); rightMargin: Style.space(8) }
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  text: modelData.query || ""; textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+                Text {
+                  width: parent.width
+                  text: (modelData.hits_count || 0) + " hits · " + (modelData.elapsed_ms || 0) + "ms"
+                      + (root.relTime(modelData.at) !== "" ? " · " + root.relTime(modelData.at) : "")
+                  textFormat: Text.PlainText
+                  color: root.dim
+                  font.family: root.fontFamily; font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+
+              MouseArea {
+                id: histMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.reuseQuery(modelData.query)
               }
             }
           }

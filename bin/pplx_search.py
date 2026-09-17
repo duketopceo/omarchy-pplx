@@ -9,17 +9,23 @@ and emits one compact JSON line on stdout for the QML panel:
      "error": string|null, "elapsed_ms": int}
 
 API key resolution order (KTD5): PERPLEXITY_API_KEY env var, then the
-optional `omaseal` keyring (`omaseal resolve omaseal://perplexity/api-key`).
+optional `omaseal` keyring (`omaseal resolve omaseal://perplexity/default`).
 The key is only ever injected into the child's environment — never on argv,
 never in stdout JSON, never logged. `pplx auth login` is TTY-only and is
 never invoked.
 
 Hardening mirrors probe_nexus.py: fixed tool-lookup path, minimal fixed
 child env, per-call byte caps and deadline, process-group kill on timeout,
-SIGALRM/setsid backstop. No shell, no writes. pplx-controlled strings are
+SIGALRM/setsid backstop. No shell. The only write is a best-effort journal:
+each successful search prepends one entry to
+~/.local/state/omarchy/pplx/history.json (descriptor-relative, atomic 0600
+temp+rename — the standby/bumblebee pattern) for the panel's History tab; a
+history failure never changes the stdout emit. pplx-controlled strings are
 control-char-normalized and length-clipped before they reach QML.
 """
-import json, os, re, selectors, shutil, signal, subprocess, sys, time
+import json, os, re, selectors, shutil, signal, stat, subprocess, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 JOB_DEADLINE_S = 15
@@ -32,7 +38,20 @@ MAX_STR = 200
 MAX_URL = 400              # urls stay openable via xdg-open; still bounded
 MAX_HITS = 8
 MAX_KEY = 256
-OMASEAL_REF = "omaseal://perplexity/api-key"
+OMASEAL_REF = "omaseal://perplexity/default"
+
+# Query history journal: newest-first list, bounded file, read back by
+# pplx_status.py for the panel. Nothing secret lands here — the query text
+# is the user's own input, the API key never is.
+try:
+    HOME = Path.home()
+except Exception:
+    HOME = Path("/")
+HISTORY_DIR_REL = ".local/state/omarchy/pplx"
+HISTORY_NAME = "history.json"
+HISTORY_MAX_BYTES = 64 * 1024   # far above 30 small entries; bounds a hostile file
+MAX_HISTORY = 30
+MAX_HISTORY_QUERY = 120
 
 SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # pplx's installer and omaseal both target ~/.local/bin. TOOL_PATH is still a
@@ -282,7 +301,88 @@ def _finish(result, started):
     return result
 
 
-def search(query, environ=None, run=None, tool=None):
+# --- history: descriptor-relative read, atomic republish (standby pattern) ---
+
+def _open_dir(path):
+    """Descriptor for a directory — no symlinks, must be ours."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        raise PermissionError("%s is not a user-owned real directory" % path)
+    return fd
+
+
+def _read_capped(dirfd, name, limit):
+    """Bounded, no-follow, regular-file read; None on any anomaly."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_size > limit:
+            return None
+        return os.read(fd, limit)
+    finally:
+        os.close(fd)
+
+
+def _publish(dirfd, name, data):
+    """Write via exclusive same-dir temp file + atomic rename, mode 0600."""
+    tmp = ".%s.%d.tmp" % (name, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=dirfd)
+    try:
+        os.write(fd, data.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+
+
+def _read_history(dirfd):
+    """history.json as a list of entry dicts (newest first); [] if unusable."""
+    raw = _read_capped(dirfd, HISTORY_NAME, HISTORY_MAX_BYTES)
+    if raw is None:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [e for e in data if isinstance(e, dict)]
+
+
+def _record_history(query, result, state_dir=None):
+    """Prepend one entry to history.json (newest first, cap MAX_HISTORY).
+
+    The journal is a convenience for the panel's History tab — every error
+    path just returns, so a filesystem problem can never change the emit.
+    """
+    try:
+        entry = {
+            "query": _clean(query, MAX_HISTORY_QUERY),
+            "hits_count": len(result.get("hits") or []),
+            "elapsed_ms": int(result.get("elapsed_ms") or 0),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        state_dir = (Path(state_dir) if state_dir is not None
+                     else HOME / HISTORY_DIR_REL)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        dirfd = _open_dir(state_dir)
+        try:
+            hist = _read_history(dirfd)
+            hist.insert(0, entry)
+            _publish(dirfd, HISTORY_NAME, json.dumps(hist[:MAX_HISTORY]))
+        finally:
+            os.close(dirfd)
+    except Exception:
+        pass
+
+
+def search(query, environ=None, run=None, tool=None, state_dir=None):
     """Run one pplx web search, returning the emit dict (all seams injectable)."""
     run = _run if run is None else run
     tool = _tool if tool is None else tool
@@ -298,7 +398,7 @@ def search(query, environ=None, run=None, tool=None):
     if not key:
         result["needs_key"] = True
         result["error"] = ("no Perplexity API key — set PERPLEXITY_API_KEY "
-                           "or `omaseal set perplexity api-key`")
+                           "or `omaseal set perplexity default`")
         return _finish(result, started)
     try:
         res = run([pplx, "search", "web", "--limit", str(MAX_HITS), "--", query],
@@ -307,7 +407,12 @@ def search(query, environ=None, run=None, tool=None):
         result = _result_from_run(res, key, result)
     finally:
         key = None  # drop the secret reference; it lives nowhere else
-    return _finish(result, started)
+    result = _finish(result, started)
+    if result["ok"]:
+        # Journal the query for the History tab. Best-effort only: a write
+        # failure must never reach the stdout contract.
+        _record_history(query, result, state_dir=state_dir)
+    return result
 
 
 def main(argv):
