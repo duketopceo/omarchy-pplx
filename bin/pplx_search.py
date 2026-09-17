@@ -9,7 +9,7 @@ and emits one compact JSON line on stdout for the QML panel:
      "error": string|null, "elapsed_ms": int}
 
 API key resolution order (KTD5): PERPLEXITY_API_KEY env var, then the
-optional `omaseal` keyring (`omaseal resolve omaseal://perplexity/default`).
+optional `omaseal` keyring (`omaseal get omaseal://perplexity/default`).
 The key is only ever injected into the child's environment — never on argv,
 never in stdout JSON, never logged. `pplx auth login` is TTY-only and is
 never invoked.
@@ -245,7 +245,7 @@ def _compact_hits(raw_hits, redact=None):
 def _resolve_key(environ=None, run=None, tool=None):
     """Return the API key (str) or None.
 
-    Order: PERPLEXITY_API_KEY, then `omaseal resolve` when omaseal is
+    Order: PERPLEXITY_API_KEY, then `omaseal get` when omaseal is
     installed (optional dep — absent or unresolved is not an error).
     The returned value is secret material: it may only be injected into a
     child env, never argv/output/logs.
@@ -259,7 +259,7 @@ def _resolve_key(environ=None, run=None, tool=None):
     omaseal = tool("omaseal")
     if not omaseal:
         return None
-    res = run([omaseal, "resolve", OMASEAL_REF],
+    res = run([omaseal, "get", OMASEAL_REF],
               timeout=OMASEAL_TIMEOUT_S, cap=OMASEAL_CAP)
     if res.get("rc") == 0 and not res.get("timeout") and not res.get("overflow"):
         for line in (res.get("out") or "").splitlines():

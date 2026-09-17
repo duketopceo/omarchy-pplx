@@ -27,10 +27,10 @@ export PERPLEXITY_API_KEY=pplx-...   # in your shell profile / session env
    or, if you use [OmaSeal](https://github.com/duketopceo/OmaSeal):
 
 ```bash
-omaseal set perplexity api-key
+omaseal set perplexity default
 ```
 
-   The plugin resolves `omaseal://perplexity/api-key` at query time. The key is
+   The plugin resolves `omaseal://perplexity/default` at query time. The key is
    injected into the pplx child process environment only — never on the command
    line, never logged, never rendered.
 

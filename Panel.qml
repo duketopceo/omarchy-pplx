@@ -99,10 +99,8 @@ Panel {
   })
 
   NumberAnimation on animPulse {
-    from: 0.3; to: 1.0; duration: 1400
-    loops: Animation.Infinite
-    running: root.opened
-    easing.type: Easing.InOutSine
+    from: 0.3; to: 1.0; duration: 1400; loops: Animation.Infinite
+    running: root.opened; easing.type: Easing.InOutSine
   }
 
   // The quick-ask editor is inside the askTab component — reach it through
@@ -132,22 +130,15 @@ Panel {
   function submitQuery() {
     var q = draft.trim()
     if (q.length === 0 || searchProc.running) return
-    hits = []
-    lastError = ""
-    elapsedMs = 0
-    hasSearched = true
-    isSearching = true
+    hits = []; lastError = ""; elapsedMs = 0
+    hasSearched = true; isSearching = true
     // The query is a single argv element — no shell, no interpolation.
     searchProc.command = [root.py, root.pluginRoot + "/bin/pplx_search.py", q]
     searchDeadline.restart()
     searchProc.running = true
   }
 
-  function killSearch() {
-    groupKill(searchProc)
-    searchDeadline.stop()
-    isSearching = false
-  }
+  function killSearch() { groupKill(searchProc); searchDeadline.stop(); isSearching = false }
 
   function openHit(url) {
     // xdg-open only gets a single argv element with an http(s) scheme.
@@ -160,10 +151,7 @@ Panel {
   function reuseQuery(q) {
     draft = String(q || "")
     currentTab = "ask"
-    Qt.callLater(function() {
-      var f = askField()
-      if (f) f.forceActiveFocus()
-    })
+    Qt.callLater(function() { var f = askField(); if (f) f.forceActiveFocus() })
   }
 
   onOpenedChanged: {
@@ -209,12 +197,7 @@ Panel {
   // Hard deadlines: a stuck helper is group-killed, never left running past
   // one poll interval.
   Timer { id: statusDeadline; interval: 8000; onTriggered: root.groupKill(statusProc) }
-  Timer {
-    id: statusTimer
-    interval: 30000
-    running: true; repeat: true; triggeredOnStart: true
-    onTriggered: root.refreshStatus()
-  }
+  Timer { id: statusTimer; interval: 30000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.refreshStatus() }
 
   // Search: {"ok","needs_key","installed","hits":[{title,url,domain,
   // snippet,date}],"error","elapsed_ms"} — spawned only on submit.
