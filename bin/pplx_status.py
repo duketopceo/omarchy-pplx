@@ -1,19 +1,27 @@
 #!/usr/bin/python3
 """Lightweight pplx status probe for the io.github.duketopceo.pplx bar icon.
 
-Emits {"installed": bool, "authed": bool, "history": [...]} on stdout.
-"authed" means an API key resolves locally — PERPLEXITY_API_KEY, or the
-optional omaseal keyring (`omaseal get omaseal://perplexity/default`).
-No network call is made and the key value is never printed, logged, or
-placed on argv. "history" is the local query journal written by
-pplx_search.py (~/.local/state/omarchy/pplx/history.json), re-emitted
-newest-first (max 30) for the panel's History tab.
+Emits {"installed": bool, "authed": bool, "copy_available": bool,
+"history": [...]} on stdout. "authed" means an API key resolves locally —
+PERPLEXITY_API_KEY, or the optional omaseal keyring (`omaseal get
+omaseal://perplexity/default`). No network call is made and the key value
+is never printed, logged, or placed on argv. "history" is the local query
+journal written by pplx_search.py
+(~/.local/state/omarchy/pplx/history.json), re-emitted newest-first
+(max 30) for the panel's History tab. "copy_available" reports whether
+/usr/bin/wl-copy exists so the panel can hide its copy action.
+
+`--delete <index>` removes exactly one journal entry by its visible
+(newest-first) index and re-emits {"ok","history","error"}; the file is
+rewritten atomically at 0600 via the same-dir temp+rename pattern.
+Out-of-range or malformed indexes are a no-op with the error field set.
 
 Hardening mirrors pplx_search.py / probe_nexus.py: fixed tool-lookup path,
 minimal fixed child env, byte caps and deadline, process-group kill on
-timeout, SIGALRM/setsid backstop. No shell, no writes — the history file
-is opened descriptor-relative and read-capped like the standby/bumblebee
-cache readers.
+timeout, SIGALRM/setsid backstop. No shell — the history file is opened
+descriptor-relative and read-capped like the standby/bumblebee cache
+readers, and the delete verb writes through the same exclusive-temp +
+rename pattern the search helper uses.
 """
 import json, os, selectors, shutil, signal, stat, subprocess, sys, time
 from pathlib import Path
@@ -35,6 +43,10 @@ HISTORY_MAX_BYTES = 64 * 1024   # bounds a hostile/corrupt file
 MAX_HISTORY = 30
 MAX_HISTORY_QUERY = 120
 MAX_HISTORY_AT = 64
+
+# wl-clipboard's copy tool: the panel's per-hit copy action execs this
+# fixed path detached; absent -> the button is hidden via copy_available.
+WL_COPY = "/usr/bin/wl-copy"
 
 SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # pplx's installer and omaseal both target ~/.local/bin. TOOL_PATH is still a
@@ -177,6 +189,19 @@ def _read_capped(dirfd, name, limit):
         os.close(fd)
 
 
+def _publish(dirfd, name, data):
+    """Write via exclusive same-dir temp file + atomic rename, mode 0600."""
+    tmp = ".%s.%d.tmp" % (name, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=dirfd)
+    try:
+        os.write(fd, data.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+
+
 def _history_entry(raw):
     """Normalize one journal entry for the panel; None to drop it."""
     if not isinstance(raw, dict):
@@ -195,18 +220,9 @@ def _history_entry(raw):
     }
 
 
-def _read_history(state_dir=None):
-    """Newest-first entry list (max MAX_HISTORY); [] on missing/corrupt."""
-    try:
-        state_dir = (Path(state_dir) if state_dir is not None
-                     else HOME / HISTORY_DIR_REL)
-        dirfd = _open_dir(state_dir)
-    except (OSError, PermissionError):
-        return []
-    try:
-        raw = _read_capped(dirfd, HISTORY_NAME, HISTORY_MAX_BYTES)
-    finally:
-        os.close(dirfd)
+def _normalized_history(dirfd, cap=None):
+    """Normalize every journal entry (newest first); cap=None keeps all."""
+    raw = _read_capped(dirfd, HISTORY_NAME, HISTORY_MAX_BYTES)
     if raw is None:
         return []
     try:
@@ -220,9 +236,51 @@ def _read_history(state_dir=None):
         clean = _history_entry(entry)
         if clean is not None:
             out.append(clean)
-        if len(out) >= MAX_HISTORY:
+        if cap is not None and len(out) >= cap:
             break
     return out
+
+
+def _read_history(state_dir=None):
+    """Newest-first entry list (max MAX_HISTORY); [] on missing/corrupt."""
+    try:
+        state_dir = (Path(state_dir) if state_dir is not None
+                     else HOME / HISTORY_DIR_REL)
+        dirfd = _open_dir(state_dir)
+    except (OSError, PermissionError):
+        return []
+    try:
+        return _normalized_history(dirfd, cap=MAX_HISTORY)
+    finally:
+        os.close(dirfd)
+
+
+def delete_history(index, state_dir=None):
+    """Remove exactly one journal entry by visible index; atomic 0600 rewrite.
+
+    Emits {"ok","history","error"} — history is the updated newest-first
+    list (panel-capped). The rewrite preserves order and drops nothing
+    else: every normalized entry is written back, not just the first 30.
+    """
+    try:
+        state_dir = (Path(state_dir) if state_dir is not None
+                     else HOME / HISTORY_DIR_REL)
+        dirfd = _open_dir(state_dir)
+    except (OSError, PermissionError):
+        return {"ok": False, "history": [], "error": "history not readable"}
+    try:
+        entries = _normalized_history(dirfd)
+        if (not isinstance(index, int) or isinstance(index, bool)
+                or index < 0 or index >= len(entries)):
+            return {"ok": False, "history": entries[:MAX_HISTORY],
+                    "error": "history index out of range"}
+        del entries[index]
+        _publish(dirfd, HISTORY_NAME, json.dumps(entries))
+        return {"ok": True, "history": entries[:MAX_HISTORY], "error": None}
+    except (OSError, ValueError):
+        return {"ok": False, "history": [], "error": "delete failed"}
+    finally:
+        os.close(dirfd)
 
 
 def _resolve_key(environ=None, run=None, tool=None):
@@ -249,8 +307,14 @@ def _resolve_key(environ=None, run=None, tool=None):
     return None
 
 
-def status(environ=None, run=None, tool=None, state_dir=None):
-    """{"installed","authed","history"} — no API call, all seams injectable."""
+def _copy_available(path=None):
+    """Whether the fixed-path wl-copy binary exists and is executable."""
+    path = WL_COPY if path is None else path
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def status(environ=None, run=None, tool=None, state_dir=None, copy_bin=None):
+    """{"installed","authed","copy_available","history"} — no API call."""
     run = _run if run is None else run
     tool = _tool if tool is None else tool
     installed = tool("pplx") is not None
@@ -259,10 +323,22 @@ def status(environ=None, run=None, tool=None, state_dir=None):
     # The journal outlives installs: read it even when pplx is gone so the
     # History tab still shows past queries.
     return {"installed": installed, "authed": authed,
+            "copy_available": _copy_available(copy_bin),
             "history": _read_history(state_dir)}
 
 
-def main():
+def main(argv):
+    # `pplx_status.py --delete <index>` removes one journal entry and
+    # re-emits the updated list; every other invocation is a status probe.
+    if len(argv) > 1 and argv[1] == "--delete":
+        index = None
+        if len(argv) > 2:
+            try:
+                index = int(argv[2], 10)
+            except ValueError:
+                index = None
+        sys.stdout.write(json.dumps(delete_history(index)) + "\n")
+        return 0
     sys.stdout.write(json.dumps(status()) + "\n")
     return 0
 
@@ -284,4 +360,4 @@ if __name__ == "__main__":
         pass
     signal.signal(signal.SIGALRM, _alrm_exit)
     signal.alarm(JOB_DEADLINE_S)
-    sys.exit(main())
+    sys.exit(main(sys.argv))

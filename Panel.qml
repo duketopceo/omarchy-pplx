@@ -12,6 +12,7 @@ Panel {
   property bool statusKnown: false
   property bool installed: false
   property bool authed: false
+  property bool copyAvailable: false
   property bool hasSearched: false
   property bool isSearching: false
   property var hits: []
@@ -19,6 +20,10 @@ Panel {
   property string lastError: ""
   property int elapsedMs: 0
   property string currentTab: "ask" // "ask" | "history"
+  // Search-option chip state — session-only (never persisted), allowlisted
+  // values only; the helper re-validates before pplx ever sees them.
+  property string recency: ""   // "" | "day" | "week" | "month"
+  property string context: ""   // "" | "low" | "medium" | "high"
   // The draft lives on root, not in the editor: the Loader destroys the Ask
   // tab's item on every switch, and the draft is what a History row writes
   // into to stage a re-ask.
@@ -132,8 +137,14 @@ Panel {
     if (q.length === 0 || searchProc.running) return
     hits = []; lastError = ""; elapsedMs = 0
     hasSearched = true; isSearching = true
-    // The query is a single argv element — no shell, no interpolation.
-    searchProc.command = [root.py, root.pluginRoot + "/bin/pplx_search.py", q]
+    // The query is a single argv element behind `--` — no shell, no
+    // interpolation. Chip state maps to flag pairs; the helper re-checks
+    // each value against its allowlist and drops anything else.
+    var cmd = [root.py, root.pluginRoot + "/bin/pplx_search.py"]
+    if (root.recency !== "") cmd.push("--recency", root.recency)
+    if (root.context !== "") cmd.push("--context", root.context)
+    cmd.push("--", q)
+    searchProc.command = cmd
     searchDeadline.restart()
     searchProc.running = true
   }
@@ -144,6 +155,23 @@ Panel {
     // xdg-open only gets a single argv element with an http(s) scheme.
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) return
     Quickshell.execDetached(["/usr/bin/xdg-open", url])
+  }
+
+  function copyHit(url) {
+    // wl-copy gets the URL as its sole argv element — the same http(s)
+    // gate as openHit. Detached exec: nothing is read back.
+    if (typeof url !== "string" || !/^https?:\/\//.test(url)) return
+    Quickshell.execDetached(["/usr/bin/wl-copy", url])
+  }
+
+  // The delete verb rewrites history.json and re-emits the updated list —
+  // the panel adopts it straight from the stdout payload.
+  function deleteHistory(index) {
+    if (deleteProc.running) return
+    deleteProc.command = [root.py, root.pluginRoot + "/bin/pplx_status.py",
+                          "--delete", String(index)]
+    deleteDeadline.restart()
+    deleteProc.running = true
   }
 
   // History row click: stage the query into the Ask editor — a re-ask is a
@@ -186,6 +214,7 @@ Panel {
           var data = JSON.parse(text)
           root.installed = !!data.installed
           root.authed = !!data.authed
+          root.copyAvailable = !!data.copy_available
           root.history = (Array.isArray(data.history) ? data.history : []).slice(0, 30)
           root.statusKnown = true
         } catch (e) {}
@@ -198,6 +227,31 @@ Panel {
   // one poll interval.
   Timer { id: statusDeadline; interval: 8000; onTriggered: root.groupKill(statusProc) }
   Timer { id: statusTimer; interval: 30000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.refreshStatus() }
+
+  // History delete: {"ok","history","error"} — spawned only by the row ✕.
+  Process {
+    id: deleteProc
+    clearEnvironment: true
+    environment: root.procEnv
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        deleteDeadline.stop()
+        try {
+          if (!text || text.trim().length === 0) { root.refreshStatus(); return }
+          if (text.length > 300000) return
+          var data = JSON.parse(text)
+          if (Array.isArray(data.history))
+            root.history = data.history.slice(0, 30)
+          else
+            root.refreshStatus()
+        } catch (e) { root.refreshStatus() }
+      }
+    }
+    onExited: deleteDeadline.stop()
+  }
+
+  Timer { id: deleteDeadline; interval: 8000; onTriggered: root.groupKill(deleteProc) }
 
   // Search: {"ok","needs_key","installed","hits":[{title,url,domain,
   // snippet,date}],"error","elapsed_ms"} — spawned only on submit.
@@ -264,7 +318,7 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: "󰍉"
-    tooltipText: "pplx · Perplexity Search"
+    tooltipText: "Perplexity Search"
     // Paints the glyph in the urgent color while the tool can't search.
     active: root.statusKnown && (!root.installed || !root.authed)
     onPressed: function (b) { root.refreshStatus(); root.toggle() }
@@ -321,14 +375,14 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
 
             Text {
-              text: "pplx"; textFormat: Text.PlainText
+              text: "Perplexity Search"; textFormat: Text.PlainText
               color: root.foreground
               font.family: root.fontFamily; font.pixelSize: Style.font.subtitle
               font.bold: true
             }
             Text {
               width: parent.width
-              text: "grounded perplexity search"; textFormat: Text.PlainText
+              text: "quick-ask for the perplexity search api"; textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily; font.pixelSize: Style.font.caption
               elide: Text.ElideRight
@@ -380,7 +434,7 @@ Panel {
               width: parent.width
               text: !root.installed
                   ? "Install pplx from github.com/perplexityai/perplexity-cli releases"
-                  : "Set PERPLEXITY_API_KEY, or: omaseal set perplexity api-key"
+                  : "Set PERPLEXITY_API_KEY, or: omaseal set perplexity default"
               textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
@@ -438,6 +492,43 @@ Panel {
     }
   }
 
+  // Shared option-chip: pill in the tab-pill idiom — accentFill selected,
+  // fgFill unselected, hover lift. modelData carries {label, value, group}
+  // where group names the root property ("recency"/"context") it toggles.
+  Component {
+    id: optionChip
+
+    Rectangle {
+      property bool sel: root[modelData.group] === modelData.value
+      height: Style.space(22)
+      width: chipLabel.implicitWidth + Style.space(14)
+      radius: Style.cornerRadius
+      color: sel ? root.accentFill(0.12)
+          : (chipMouse.containsMouse ? root.fgFill(0.08) : root.fgFill(0.04))
+      border.color: sel ? root.accentFill(0.45) : root.fgFill(0.10)
+      border.width: 1
+
+      Text {
+        id: chipLabel
+        anchors.centerIn: parent
+        text: modelData.label; textFormat: Text.PlainText
+        color: sel ? root.foreground : root.dim
+        font.bold: sel
+        font.family: root.fontFamily; font.pixelSize: Style.font.caption
+      }
+
+      MouseArea {
+        id: chipMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        // Toggle: tapping the selected chip clears back to no flag.
+        onClicked: root[modelData.group] =
+            (root[modelData.group] === modelData.value ? "" : modelData.value)
+      }
+    }
+  }
+
   // ---- Ask tab ----
   Component {
     id: askTab
@@ -480,6 +571,56 @@ Panel {
             color: root.dim
             font: queryField.font
             elide: Text.ElideRight
+          }
+        }
+      }
+
+      // Search options: compact chip rows under the ask field. State is
+      // session-only; submitQuery() maps it to the helper's allowlisted
+      // flag pairs — nothing else can reach pplx.
+      Column {
+        visible: root.ready
+        width: parent.width
+        spacing: Style.space(6)
+
+        Row {
+          spacing: Style.space(6)
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Recency"; textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily; font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: [
+              {"label": "Any", "value": "", "group": "recency"},
+              {"label": "Day", "value": "day", "group": "recency"},
+              {"label": "Week", "value": "week", "group": "recency"},
+              {"label": "Month", "value": "month", "group": "recency"}
+            ]
+            delegate: optionChip
+          }
+        }
+
+        Row {
+          spacing: Style.space(6)
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Context"; textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily; font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: [
+              {"label": "Low", "value": "low", "group": "context"},
+              {"label": "Med", "value": "medium", "group": "context"},
+              {"label": "High", "value": "high", "group": "context"}
+            ]
+            delegate: optionChip
           }
         }
       }
@@ -575,7 +716,8 @@ Panel {
                   }
 
                   Text {
-                    anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                    anchors { right: parent.right; verticalCenter: parent.verticalCenter
+                              rightMargin: root.copyAvailable ? Style.space(28) : 0 }
                     visible: modelData.date !== ""
                     text: modelData.date; textFormat: Text.PlainText
                     color: root.dim
@@ -612,9 +754,48 @@ Panel {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.openHit(modelData.url)
               }
+
+              // Copy URL — declared after hitArea so it stacks above the
+              // card's click-through area; hidden unless wl-copy exists.
+              Rectangle {
+                visible: root.copyAvailable
+                anchors { top: parent.top; topMargin: Style.space(8)
+                          right: parent.right; rightMargin: Style.space(8) }
+                width: Style.space(22); height: Style.space(22)
+                radius: Style.cornerRadius
+                color: copyMouse.containsMouse ? root.accentFill(0.15) : root.fgFill(0.06)
+                border.color: copyMouse.containsMouse ? root.accentFill(0.45) : root.fgFill(0.10)
+                border.width: 1
+
+                Text {
+                  anchors.centerIn: parent
+                  text: "󰆏"; textFormat: Text.PlainText
+                  color: copyMouse.containsMouse ? root.accent : root.dim
+                  font.family: root.fontFamily; font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                  id: copyMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.copyHit(modelData.url)
+                }
+              }
             }
           }
         }
+      }
+
+      // Brand footer — honest attribution, text mark only (no logo assets).
+      Text {
+        width: parent.width
+        text: "Powered by the Perplexity Search API"
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily; font.pixelSize: Style.font.caption
+        horizontalAlignment: Text.AlignHCenter
+        opacity: 0.8
       }
     }
   }
@@ -667,7 +848,7 @@ Panel {
               Column {
                 id: histColumn
                 anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter
-                          leftMargin: Style.space(8); rightMargin: Style.space(8) }
+                          leftMargin: Style.space(8); rightMargin: Style.space(28) }
                 spacing: Style.space(2)
 
                 Text {
@@ -695,6 +876,25 @@ Panel {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.reuseQuery(modelData.query)
+              }
+
+              // Delete this entry — declared after histMouse so it stacks
+              // above the row's click-to-reuse area.
+              Text {
+                anchors { right: parent.right; rightMargin: Style.space(8)
+                          verticalCenter: parent.verticalCenter }
+                text: "✕"; textFormat: Text.PlainText
+                color: delMouse.containsMouse ? root.urgent : root.dim
+                font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+
+                MouseArea {
+                  id: delMouse
+                  anchors.fill: parent
+                  anchors.margins: -6
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.deleteHistory(index)
+                }
               }
             }
           }

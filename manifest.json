@@ -1,19 +1,19 @@
 {
   "schemaVersion": 1,
   "id": "io.github.duketopceo.pplx",
-  "name": "pplx",
+  "name": "Perplexity Search",
   "version": "0.1.0",
   "author": "duketopceo",
   "license": "MIT",
-  "description": "Quick-ask Perplexity search from the bar: grounded answers with cited sources (wraps Perplexity's pplx CLI, BYOK)",
+  "description": "Quick-ask UI for the Perplexity Search API (pplx CLI)",
   "kinds": ["bar-widget"],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "pplx",
-    "description": "Grounded web search without leaving the desktop",
+    "displayName": "Perplexity Search",
+    "description": "Quick-ask web search without leaving the desktop",
     "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right"

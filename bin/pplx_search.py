@@ -22,6 +22,13 @@ each successful search prepends one entry to
 temp+rename — the standby/bumblebee pattern) for the panel's History tab; a
 history failure never changes the stdout emit. pplx-controlled strings are
 control-char-normalized and length-clipped before they reach QML.
+
+Search options (KTD4): the panel passes --recency/--context/--limit pairs
+ahead of the query. Each value is matched against a strict allowlist —
+recency {hour,day,week,month,year} -> --recency-filter, context
+{low,medium,high} -> --search-context-size, limit int 1..20 -> -n. Any
+other value produces no flag at all; unrecognized tokens are never
+forwarded to pplx (they can only become query text after `--`).
 """
 import json, os, re, selectors, shutil, signal, stat, subprocess, sys, time
 from datetime import datetime, timezone
@@ -39,6 +46,12 @@ MAX_URL = 400              # urls stay openable via xdg-open; still bounded
 MAX_HITS = 8
 MAX_KEY = 256
 OMASEAL_REF = "omaseal://perplexity/default"
+
+# Allowlisted search modifiers (KTD4). Only these exact values ever become
+# pplx argv — anything else is silently dropped to the default flag set.
+RECENCY_ALLOW = frozenset(("hour", "day", "week", "month", "year"))
+CONTEXT_ALLOW = frozenset(("low", "medium", "high"))
+MAX_LIMIT = 20
 
 # Query history journal: newest-first list, bounded file, read back by
 # pplx_status.py for the panel. Nothing secret lands here — the query text
@@ -242,6 +255,47 @@ def _compact_hits(raw_hits, redact=None):
     return hits
 
 
+def _search_flags(opts):
+    """Map panel option state onto the allowlisted pplx flag argv (KTD4).
+
+    opts is {"recency","context","limit": raw strings}. Only exact
+    allowlist matches emit a flag — anything else contributes nothing.
+    """
+    flags = ["-n", str(MAX_HITS)]
+    if not isinstance(opts, dict):
+        return flags
+    limit = opts.get("limit")
+    try:
+        n = int(str(limit), 10) if limit is not None else None
+    except (TypeError, ValueError):
+        n = None
+    if n is not None and 1 <= n <= MAX_LIMIT:
+        flags[1] = str(n)
+    recency = opts.get("recency")
+    if isinstance(recency, str) and recency in RECENCY_ALLOW:
+        flags += ["--recency-filter", recency]
+    context = opts.get("context")
+    if isinstance(context, str) and context in CONTEXT_ALLOW:
+        flags += ["--search-context-size", context]
+    return flags
+
+
+def _parse_args(argv):
+    """Split leading `--recency/--context/--limit <value>` pairs from the
+    query tail. Unknown tokens (and a dangling flag with no value) stay in
+    the tail — they can only ever become query text, never pplx flags.
+    A literal `--` ends option parsing, like the one pplx gets itself.
+    """
+    opts = {}
+    i = 0
+    while i + 1 < len(argv) and argv[i] in ("--recency", "--context", "--limit"):
+        opts[argv[i][2:]] = argv[i + 1]
+        i += 2
+    if i < len(argv) and argv[i] == "--":
+        i += 1
+    return opts, argv[i:]
+
+
 def _resolve_key(environ=None, run=None, tool=None):
     """Return the API key (str) or None.
 
@@ -382,7 +436,7 @@ def _record_history(query, result, state_dir=None):
         pass
 
 
-def search(query, environ=None, run=None, tool=None, state_dir=None):
+def search(query, environ=None, run=None, tool=None, state_dir=None, opts=None):
     """Run one pplx web search, returning the emit dict (all seams injectable)."""
     run = _run if run is None else run
     tool = _tool if tool is None else tool
@@ -401,8 +455,8 @@ def search(query, environ=None, run=None, tool=None, state_dir=None):
                            "or `omaseal set perplexity default`")
         return _finish(result, started)
     try:
-        res = run([pplx, "search", "web", "--limit", str(MAX_HITS), "--", query],
-                  timeout=PPLX_TIMEOUT_S, cap=MAX_OUT_BYTES,
+        argv = [pplx, "search", "web"] + _search_flags(opts) + ["--", query]
+        res = run(argv, timeout=PPLX_TIMEOUT_S, cap=MAX_OUT_BYTES,
                   extra_env={"PERPLEXITY_API_KEY": key})
         result = _result_from_run(res, key, result)
     finally:
@@ -416,14 +470,16 @@ def search(query, environ=None, run=None, tool=None, state_dir=None):
 
 
 def main(argv):
-    query = " ".join(argv[1:]).replace("\x00", " ").strip()
+    opts, tail = _parse_args(argv[1:])
+    query = " ".join(tail).replace("\x00", " ").strip()
     if not query:
         sys.stdout.write(json.dumps({
             "ok": False, "needs_key": False, "installed": False,
-            "hits": [], "error": "usage: pplx_search.py <query>",
-            "elapsed_ms": 0}) + "\n")
+            "hits": [], "elapsed_ms": 0,
+            "error": ("usage: pplx_search.py [--recency <v>] [--context <v>] "
+                      "[--limit <n>] [--] <query>")}) + "\n")
         return 2
-    sys.stdout.write(json.dumps(search(query))[:MAX_OUT_BYTES] + "\n")
+    sys.stdout.write(json.dumps(search(query, opts=opts))[:MAX_OUT_BYTES] + "\n")
     return 0
 
 

@@ -1,7 +1,8 @@
-# pplx
+# Perplexity Search
 
-Quick-ask Perplexity search from the Omarchy bar. Type a question, get grounded
-results with sources, click to open — without leaving the desktop.
+Quick-ask UI for the Perplexity Search API from the Omarchy bar. Type a
+question, get grounded results with sources, click to open — without leaving
+the desktop.
 
 Wraps [perplexityai/perplexity-cli](https://github.com/perplexityai/perplexity-cli)
 (Apache-2.0), the `pplx` CLI for the Perplexity Search API. **BYOK** — you supply
@@ -44,7 +45,21 @@ omarchy plugin enable io.github.duketopceo.pplx
 ## Features
 
 - Search-glyph bar button; dropdown with a quick-ask field
-- Results list: title, domain, date, snippet — click opens via `xdg-open`
+- **Search option chips** under the ask field — session-only, mapped to the
+  upstream CLI through a strict allowlist in `bin/pplx_search.py`:
+  - *Recency* `Any`/`Day`/`Week`/`Month` → `--recency-filter day|week|month`
+    (`Any` sends no flag)
+  - *Context* `Low`/`Med`/`High` → `--search-context-size low|medium|high`
+    (tap a selected chip to clear back to no flag)
+  - CLI-side the helper also accepts `--limit <n>` → `-n <n>` (1–20; the
+    panel leaves it at the default of 8). Anything outside the allowlists
+    is dropped — it can never reach `pplx` as a flag.
+- Results list: title, domain, date, snippet — click opens via `xdg-open`;
+  a copy button on each card pipes the URL through `wl-copy` (http(s) only,
+  hidden when `wl-copy` isn't installed)
+- **History tab**: recent queries; click a row to stage a re-ask, `✕` deletes
+  that entry (`bin/pplx_status.py --delete <index>` rewrites the journal
+  atomically at 0600)
 - Status probe distinguishes not-installed / needs-key / ready
 - Setup panes guide install and key configuration — no dead calls
 
@@ -61,9 +76,14 @@ omarchy plugin enable io.github.duketopceo.pplx
 
 ## External dependencies
 
+See [UPSTREAM.md](UPSTREAM.md) for the upstream tool repo, license, and
+per-architecture install commands.
+
 - `pplx` binary (upstream releases; amd64 + arm64)
 - A Perplexity API key (upstream account; API usage may incur cost)
 - Optional: `omaseal` for keyring-backed key storage
+- Optional: `wl-copy` (wl-clipboard) for the per-result copy button —
+  the button hides itself when absent
 
 ## Remove
 
