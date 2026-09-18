@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "id": "io.github.duketopceo.pplx",
   "name": "Perplexity Search",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "duketopceo",
   "license": "MIT",
   "description": "Quick-ask UI for the Perplexity Search API (pplx CLI)",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
