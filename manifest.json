@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.duketopceo.pplx",
   "name": "Perplexity Search",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "duketopceo",
   "license": "MIT",
   "description": "Quick-ask UI for the Perplexity Search API (pplx CLI)",
