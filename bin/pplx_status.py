@@ -11,10 +11,14 @@ journal written by pplx_search.py
 (max 30) for the panel's History tab. "copy_available" reports whether
 /usr/bin/wl-copy exists so the panel can hide its copy action.
 
-`--delete <index>` removes exactly one journal entry by its visible
-(newest-first) index and re-emits {"ok","history","error"}; the file is
-rewritten atomically at 0600 via the same-dir temp+rename pattern.
-Out-of-range or malformed indexes are a no-op with the error field set.
+`--delete <index> [--at <ts>] [--query <q>]` removes exactly one journal
+entry and re-emits {"ok","history","error"}; the file is rewritten
+atomically at 0600 via the same-dir temp+rename pattern. The optional
+at/query tags identify the entry the panel rendered: a racing journal
+insert shifts every index, so when tags are present the delete resolves
+by identity (rendered position first, then a full scan) instead of
+trusting position alone. Out-of-range/malformed indexes and unmatched
+tags are a no-op with the error field set.
 
 Hardening mirrors pplx_search.py / probe_nexus.py: fixed tool-lookup path,
 minimal fixed child env, byte caps and deadline, process-group kill on
@@ -255,8 +259,17 @@ def _read_history(state_dir=None):
         os.close(dirfd)
 
 
-def delete_history(index, state_dir=None):
-    """Remove exactly one journal entry by visible index; atomic 0600 rewrite.
+def delete_history(index, state_dir=None, at=None, query=None):
+    """Remove exactly one journal entry; atomic 0600 rewrite.
+
+    `index` is the visible (newest-first) position the panel rendered;
+    `at`/`query` tag the entry the user actually clicked. A journal
+    prepend landing between render and click shifts every index, so a
+    bare index can delete the wrong row — when the tagged fields are
+    present the delete resolves the rendered position first and then
+    falls back to a full scan for the (at, query) pair, so a racing
+    insert can no longer retarget the row. With no tags, the legacy
+    index-only behavior is unchanged.
 
     Emits {"ok","history","error"} — history is the updated newest-first
     list (panel-capped). The rewrite preserves order and drops nothing
@@ -270,11 +283,29 @@ def delete_history(index, state_dir=None):
         return {"ok": False, "history": [], "error": "history not readable"}
     try:
         entries = _normalized_history(dirfd)
-        if (not isinstance(index, int) or isinstance(index, bool)
-                or index < 0 or index >= len(entries)):
+        index_ok = (isinstance(index, int) and not isinstance(index, bool)
+                    and 0 <= index < len(entries))
+        target = None
+        if at is not None or query is not None:
+            def _matches(e):
+                return ((at is None or e.get("at") == at)
+                        and (query is None or e.get("query") == query))
+            if index_ok and _matches(entries[index]):
+                target = index
+            else:
+                # The rendered list shifted — find the entry the user
+                # actually clicked by identity instead of by position.
+                target = next(
+                    (i for i, e in enumerate(entries) if _matches(e)), None)
+            if target is None:
+                return {"ok": False, "history": entries[:MAX_HISTORY],
+                        "error": "history entry not found"}
+        elif index_ok:
+            target = index
+        else:
             return {"ok": False, "history": entries[:MAX_HISTORY],
                     "error": "history index out of range"}
-        del entries[index]
+        del entries[target]
         _publish(dirfd, HISTORY_NAME, json.dumps(entries))
         return {"ok": True, "history": entries[:MAX_HISTORY], "error": None}
     except (OSError, ValueError):
@@ -328,16 +359,31 @@ def status(environ=None, run=None, tool=None, state_dir=None, copy_bin=None):
 
 
 def main(argv):
-    # `pplx_status.py --delete <index>` removes one journal entry and
-    # re-emits the updated list; every other invocation is a status probe.
+    # `pplx_status.py --delete <index> [--at <ts>] [--query <q>]` removes
+    # one journal entry and re-emits the updated list; every other
+    # invocation is a status probe.
     if len(argv) > 1 and argv[1] == "--delete":
         index = None
-        if len(argv) > 2:
+        at = None
+        query = None
+        args = argv[2:]
+        i = 0
+        if i < len(args) and not args[i].startswith("--"):
             try:
-                index = int(argv[2], 10)
+                index = int(args[i], 10)
             except ValueError:
                 index = None
-        sys.stdout.write(json.dumps(delete_history(index)) + "\n")
+            i += 1
+        # Trailing flag pairs tag the rendered entry — values are taken
+        # verbatim, so a flag-shaped query string can't become a flag.
+        while i + 1 < len(args) and args[i] in ("--at", "--query"):
+            if args[i] == "--at":
+                at = args[i + 1]
+            else:
+                query = args[i + 1]
+            i += 2
+        sys.stdout.write(
+            json.dumps(delete_history(index, at=at, query=query)) + "\n")
         return 0
     sys.stdout.write(json.dumps(status()) + "\n")
     return 0

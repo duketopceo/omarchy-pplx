@@ -15,6 +15,9 @@ Panel {
   property bool copyAvailable: false
   property bool hasSearched: false
   property bool isSearching: false
+  // Set when the close path kills an in-flight search: the killed
+  // process's empty stdout is a user cancel, not a helper failure.
+  property bool searchCancelled: false
   property var hits: []
   property var history: []
   property string lastError: ""
@@ -136,6 +139,7 @@ Panel {
     var q = draft.trim()
     if (q.length === 0 || searchProc.running) return
     hits = []; lastError = ""; elapsedMs = 0
+    searchCancelled = false
     hasSearched = true; isSearching = true
     // The query is a single argv element behind `--` — no shell, no
     // interpolation. Chip state maps to flag pairs; the helper re-checks
@@ -149,27 +153,39 @@ Panel {
     searchProc.running = true
   }
 
-  function killSearch() { groupKill(searchProc); searchDeadline.stop(); isSearching = false }
+  function killSearch() {
+    if (searchProc.running) root.searchCancelled = true
+    groupKill(searchProc); searchDeadline.stop(); isSearching = false
+  }
 
   function openHit(url) {
-    // xdg-open only gets a single argv element with an http(s) scheme.
-    if (typeof url !== "string" || !/^https?:\/\//.test(url)) return
+    // xdg-open only gets a single argv element with an https scheme —
+    // the API only ever returns https links, so there is no legitimate
+    // plain-http hit for the wider http(s) gate to admit.
+    if (typeof url !== "string" || !/^https:\/\//.test(url)) return
     Quickshell.execDetached(["/usr/bin/xdg-open", url])
   }
 
   function copyHit(url) {
-    // wl-copy gets the URL as its sole argv element — the same http(s)
+    // wl-copy gets the URL as its sole argv element — the same https-only
     // gate as openHit. Detached exec: nothing is read back.
-    if (typeof url !== "string" || !/^https?:\/\//.test(url)) return
+    if (typeof url !== "string" || !/^https:\/\//.test(url)) return
     Quickshell.execDetached(["/usr/bin/wl-copy", url])
   }
 
   // The delete verb rewrites history.json and re-emits the updated list —
-  // the panel adopts it straight from the stdout payload.
+  // the panel adopts it straight from the stdout payload. The row's
+  // at+query go along as identity tags: a search journaling between
+  // render and click shifts every index, so the helper re-resolves the
+  // entry by identity when the position no longer matches.
   function deleteHistory(index) {
     if (deleteProc.running) return
+    var row = root.history[index]
+    if (!row) return
     deleteProc.command = [root.py, root.pluginRoot + "/bin/pplx_status.py",
-                          "--delete", String(index)]
+                          "--delete", String(index),
+                          "--at", String(row.at || ""),
+                          "--query", String(row.query || "")]
     deleteDeadline.restart()
     deleteProc.running = true
   }
@@ -209,15 +225,28 @@ Panel {
       onStreamFinished: {
         statusDeadline.stop()
         try {
-          if (!text || text.trim().length === 0) return
-          if (text.length > 300000) return
+          // An empty or unusable emit is still a concluded probe: flip
+          // statusKnown so the pill resolves to a state instead of
+          // pulsing "CHECKING" forever on a dead helper.
+          if (!text || text.trim().length === 0) { root.statusKnown = true; return }
+          if (text.length > 300000) { root.statusKnown = true; return }
           var data = JSON.parse(text)
           root.installed = !!data.installed
           root.authed = !!data.authed
           root.copyAvailable = !!data.copy_available
           root.history = (Array.isArray(data.history) ? data.history : []).slice(0, 30)
           root.statusKnown = true
-        } catch (e) {}
+        } catch (e) { root.statusKnown = true }
+      }
+    }
+    // Helper tracebacks land here — without the collector a crash is
+    // indistinguishable from silence in the panel.
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var err = String(text || "").trim()
+        if (err)
+          console.warn("pplx_status stderr: " + err.substring(0, 500))
       }
     }
     onExited: statusDeadline.stop()
@@ -241,11 +270,24 @@ Panel {
           if (!text || text.trim().length === 0) { root.refreshStatus(); return }
           if (text.length > 300000) return
           var data = JSON.parse(text)
+          if (data === null || typeof data !== "object") { root.refreshStatus(); return }
           if (Array.isArray(data.history))
             root.history = data.history.slice(0, 30)
           else
             root.refreshStatus()
+          // The delete verb reports failures in-band — surface them on the
+          // panel's error channel rather than dropping them silently.
+          if (typeof data.error === "string" && data.error !== "")
+            root.lastError = data.error
         } catch (e) { root.refreshStatus() }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var err = String(text || "").trim()
+        if (err)
+          console.warn("pplx_status --delete stderr: " + err.substring(0, 500))
       }
     }
     onExited: deleteDeadline.stop()
@@ -267,6 +309,8 @@ Panel {
         root.isSearching = false
         try {
           if (!text || text.trim().length === 0) {
+            // A kill from the close path is a user cancel — no banner.
+            if (root.searchCancelled) { root.searchCancelled = false; return }
             if (root.lastError === "") root.lastError = "no output from helper"
             return
           }
@@ -297,6 +341,14 @@ Panel {
           root.hits = []
           root.lastError = "unparseable helper output"
         }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var err = String(text || "").trim()
+        if (err)
+          console.warn("pplx_search stderr: " + err.substring(0, 500))
       }
     }
     onExited: { searchDeadline.stop(); root.isSearching = false }
