@@ -1,4 +1,13 @@
-# Perplexity Search
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/lockup-dark.svg">
+    <img src="assets/brand/lockup.svg" alt="Perplexity Search" height="48">
+  </picture>
+</p>
+
+<p align="center"><strong>Ask the Perplexity Search API from the Omarchy bar. Bring your own key.</strong></p>
+
+<!-- Logo is a proposal pending owner sign-off. TODO: replace preview.png (a listing mock-up) with a real screenshot from a live Omarchy session. -->
 
 Quick-ask UI for the Perplexity Search API from the Omarchy bar. Type a
 question, get grounded results with sources, click to open — without leaving
@@ -91,5 +100,25 @@ per-architecture install commands.
 omarchy plugin disable io.github.duketopceo.pplx
 omarchy plugin remove io.github.duketopceo.pplx
 ```
+
+## How it works
+
+```mermaid
+flowchart LR
+  P[Panel.qml ask field + chips] --> S[bin/pplx_search.py allowlist]
+  S --> X[pplx binary] --> A[Perplexity Search API]
+  K[env key or omaseal] -.child env only.-> X
+  P --> Z[bin/pplx_status.py status + history]
+```
+
+## Status and roadmap
+
+Proposed program roadmap with difficulty, feasibility and simpler alternatives: [ROADMAP.md](ROADMAP.md). Design direction: [DESIGN.md](DESIGN.md). Landscape notes: [docs/research/2026-10-10-landscape.md](docs/research/2026-10-10-landscape.md).
+
+## Contributing
+
+This repository is the published mirror of [`duketopceo/omarchy-plugins`](https://github.com/duketopceo/omarchy-plugins) (`plugins/io.github.duketopceo.pplx/`). Open issues here; send changes to the umbrella, because a direct commit here is overwritten by the next publish. Read `AGENTS.md` first.
+
+## License
 
 MIT — see [LICENSE](LICENSE). Upstream: Apache-2.0 (Perplexity).
